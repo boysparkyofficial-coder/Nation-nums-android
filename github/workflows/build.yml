@@ -73,8 +73,8 @@ jobs:
                   applicationId 'com.nationnums.app'
                   minSdk 23
                   targetSdk 35
-                  versionCode 1
-                  versionName '1.0'
+                  versionCode 2
+                  versionName '1.1'
               }
 
               compileOptions {
@@ -86,17 +86,24 @@ jobs:
                   jvmTarget = '17'
               }
           }
+
+          dependencies {
+              implementation 'androidx.appcompat:appcompat:1.7.0'
+              implementation 'androidx.core:core-ktx:1.13.1'
+              implementation 'androidx.biometric:biometric:1.1.0'
+          }
           EOF
 
           cat > app/src/main/AndroidManifest.xml <<'EOF'
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.USE_BIOMETRIC" />
 
               <application
                   android:allowBackup="false"
                   android:label="Nation Nums"
                   android:usesCleartextTraffic="false"
-                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
 
                   <activity
                       android:name=".MainActivity"
@@ -115,22 +122,28 @@ jobs:
           cat > app/src/main/java/com/nationnums/app/MainActivity.kt <<'EOF'
           package com.nationnums.app
 
-          import android.app.Activity
+          import android.net.Uri
           import android.os.Bundle
+          import android.webkit.JavascriptInterface
+          import android.webkit.WebChromeClient
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebSettings
           import android.webkit.WebView
           import android.webkit.WebViewClient
-          import android.webkit.WebChromeClient
-          import android.webkit.WebSettings
-          import android.webkit.WebResourceRequest
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.biometric.BiometricManager
+          import androidx.biometric.BiometricPrompt
+          import androidx.core.content.ContextCompat
 
-          class MainActivity : Activity() {
+          class MainActivity : AppCompatActivity() {
               private lateinit var webView: WebView
+              private var backgroundedAt: Long = 0L
+              private var promptInFlight = false
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
 
                   webView = WebView(this)
-
                   webView.settings.javaScriptEnabled = true
                   webView.settings.domStorageEnabled = true
                   webView.settings.cacheMode = WebSettings.LOAD_DEFAULT
@@ -140,18 +153,114 @@ jobs:
                           view: WebView,
                           request: WebResourceRequest
                       ): Boolean {
-                          val url = request.url
-                          return url.scheme != "https"
+                          return request.url.scheme != "https"
                       }
                   }
 
                   webView.webChromeClient = WebChromeClient()
+                  webView.addJavascriptInterface(BiometricBridge(), "NationNative")
                   setContentView(webView)
 
                   if (savedInstanceState == null) {
                       webView.loadUrl("https://nation-nums.base44.app")
                   } else {
                       webView.restoreState(savedInstanceState)
+                  }
+              }
+
+              // The website calls window.NationNative to unlock with the device biometric.
+              inner class BiometricBridge {
+                  @JavascriptInterface
+                  fun isBiometricAvailable(): Boolean {
+                      if (!trustedPage()) return false
+                      val allowed = BiometricManager.Authenticators.BIOMETRIC_STRONG or
+                          BiometricManager.Authenticators.BIOMETRIC_WEAK
+                      return BiometricManager.from(this@MainActivity)
+                          .canAuthenticate(allowed) == BiometricManager.BIOMETRIC_SUCCESS
+                  }
+
+                  @JavascriptInterface
+                  fun requestBiometricUnlock() {
+                      if (!trustedPage()) return
+                      runOnUiThread { showBiometricPrompt() }
+                  }
+              }
+
+              private fun showBiometricPrompt() {
+                  if (promptInFlight) return
+                  promptInFlight = true
+
+                  val callback = object : BiometricPrompt.AuthenticationCallback() {
+                      override fun onAuthenticationSucceeded(
+                          result: BiometricPrompt.AuthenticationResult
+                      ) {
+                          promptInFlight = false
+                          notifyWeb(true)
+                      }
+
+                      override fun onAuthenticationError(
+                          errorCode: Int,
+                          errString: CharSequence
+                      ) {
+                          promptInFlight = false
+                          notifyWeb(false)
+                      }
+
+                      override fun onAuthenticationFailed() {
+                          // The prompt stays open so the customer can try again.
+                      }
+                  }
+
+                  val allowed = BiometricManager.Authenticators.BIOMETRIC_STRONG or
+                      BiometricManager.Authenticators.BIOMETRIC_WEAK
+
+                  val prompt = BiometricPrompt(
+                      this,
+                      ContextCompat.getMainExecutor(this),
+                      callback
+                  )
+
+                  val promptInfo = BiometricPrompt.PromptInfo.Builder()
+                      .setTitle("Unlock Nation Nums")
+                      .setSubtitle("Use your fingerprint or face to continue")
+                      .setNegativeButtonText("Cancel")
+                      .setAllowedAuthenticators(allowed)
+                      .build()
+
+                  prompt.authenticate(promptInfo)
+              }
+
+              private fun notifyWeb(success: Boolean) {
+                  val js = "window.dispatchEvent(new MessageEvent('message'," +
+                      "{data:{type:'biometricUnlockResult',success:" + success + "}}))"
+                  webView.post { webView.evaluateJavascript(js, null) }
+              }
+
+              private fun dispatchResume(inactiveMs: Long) {
+                  val js = "window.dispatchEvent(new CustomEvent('nn-native-resume'," +
+                      "{detail:{inactiveMs:" + inactiveMs + "}}))"
+                  webView.post { webView.evaluateJavascript(js, null) }
+              }
+
+              private fun trustedPage(): Boolean {
+                  val host = webView.url?.let { Uri.parse(it).host } ?: return false
+                  return host == "nation-nums.base44.app" ||
+                      host.endsWith(".base44.app") ||
+                      host == "nationnums.com" ||
+                      host.endsWith(".nationnums.com")
+              }
+
+              override fun onStop() {
+                  backgroundedAt = System.currentTimeMillis()
+                  super.onStop()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  if (backgroundedAt > 0L) {
+                      val inactiveMs = System.currentTimeMillis() - backgroundedAt
+                      backgroundedAt = 0L
+                      dispatchResume(inactiveMs)
                   }
               }
 
